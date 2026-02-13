@@ -13,7 +13,6 @@ import streamlit as st
 from langchain_community.retrievers import WikipediaRetriever
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 
 # Suppress PyTorch warnings
@@ -65,12 +64,41 @@ def get_openai_api_key():
 
 
 def initialize_llm(api_key: str):
-    """Initialize the ChatOpenAI LLM with the provided API key."""
+    """Initialize the ChatOpenAI LLM with the provided API key.
+    
+    GPT-5 series are reasoning models and require the Responses API.
+    They use 'reasoning_effort' instead of 'temperature'.
+    """
     return ChatOpenAI(
-        model_name="gpt-4o-mini",
-        temperature=0.3,
+        model="gpt-5-mini-2025-08-07",
+        reasoning_effort="low",
+        use_responses_api=True,
         openai_api_key=api_key
     )
+
+
+def extract_text_from_content(content) -> str:
+    """
+    Extract plain text from an LLM response content.
+    
+    The Responses API returns content as a list of blocks:
+      [{'type': 'reasoning', ...}, {'type': 'text', 'text': '...'}]
+    whereas the Chat Completions API returns a plain string.
+    This helper handles both formats.
+    """
+    if isinstance(content, str):
+        return content
+    
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                text_parts.append(block)
+        return "\n".join(text_parts)
+    
+    return str(content)
 
 
 # ============================================================================
@@ -112,7 +140,7 @@ Return ONLY a valid JSON object (no markdown, no extra text) with these keys:
 {{
   "status": "valid" | "ambiguous" | "invalid",
   "message": "<short feedback message>",
-  "clarification_options": ["<option 1>", "<option 2>", "<option 3>"]
+  "clarification_options": ["<question 1>", "<question 2>", "<question 3>"]
 }}
 
 Classification rules:
@@ -124,8 +152,18 @@ Classification rules:
 • "ambiguous" – The input is too vague, is an acronym with multiple
                 meanings, or could refer to several different industries
                 (e.g., "AI", "pet", "chip", "green").
-                Provide exactly 3 clarification options phrased as
-                specific industries the user might mean.
+                Provide exactly 3 clarification_options.
+                IMPORTANT: Each option MUST be a full clarifying question,
+                NOT a short keyword. Start each question with a phrase like:
+                - "Are you referring to..."
+                - "Do you mean..."
+                - "Are you interested in..."
+                Example for input "pet":
+                [
+                  "Are you referring to pets as animals kept for companionship?",
+                  "Do you mean \"PET\" in a scientific or medical context, such as Positron Emission Tomography?",
+                  "Are you interested in a specific aspect of pets, like care, types, or behavior?"
+                ]
 
 • "invalid"  – The input is gibberish, offensive, a greeting, a question,
                or clearly not related to any industry/market sector
@@ -134,10 +172,11 @@ Classification rules:
         ("human", "User input: {user_input}")
     ])
 
-    chain = validation_prompt | llm | StrOutputParser()
+    chain = validation_prompt | llm
 
     try:
-        raw_response = chain.invoke({"user_input": user_input.strip()})
+        response = chain.invoke({"user_input": user_input.strip()})
+        raw_response = extract_text_from_content(response.content)
 
         # Strip possible markdown code fences the LLM might add
         cleaned = raw_response.strip()
@@ -277,7 +316,7 @@ based strictly on the information above.""")
     try:
         # Generate the report
         response = llm.invoke(formatted_prompt)
-        report = response.content
+        report = extract_text_from_content(response.content)
         
         return report
     
@@ -423,11 +462,12 @@ def main():
             st.stop()
 
         elif validation["status"] == "ambiguous":
-            st.warning(f"🤔 {validation['message']}")
-            st.markdown("**Please clarify — did you mean one of these?**")
-            for idx, option in enumerate(validation.get("clarification_options", []), 1):
-                st.info(f"{idx}. {option}")
-            st.caption("💡 Tip: Re-enter a more specific industry name above and click **Generate Report** again.")
+            st.subheader("I need a bit more detail to avoid pulling the wrong pages")
+            questions = validation.get("clarification_options", [])
+            questions_text = "\n".join(
+                f"{idx}. {q}" for idx, q in enumerate(questions, 1)
+            )
+            st.info(questions_text)
             st.stop()
 
         # status == "valid" — proceed
