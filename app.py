@@ -291,20 +291,22 @@ def generate_market_research_report(
 market research report based STRICTLY on the provided Wikipedia context. 
 
 IMPORTANT CONSTRAINTS:
-- The report must be LESS THAN 500 WORDS
+- STRICT WORD LIMIT: The report MUST be NO MORE THAN 400 words. This is a hard limit.
+- Count your words carefully. Do NOT exceed 400 words under any circumstances.
 - Base your report ONLY on the information provided in the context
 - Do NOT include any information not found in the context
 - Write in a professional tone suitable for business analysts
 - Focus on market trends, industry overview, key players, and business insights
-- Structure the report with clear sections if appropriate"""),
+- Structure the report with clear sections if appropriate
+- Be concise and prioritize the most important information"""),
         
         ("human", """Generate a market research report for the following industry: {industry}
 
 Wikipedia Context:
 {context}
 
-Please provide a comprehensive but concise market research report (under 500 words) 
-based strictly on the information above.""")
+Provide a comprehensive but concise market research report.
+REMINDER: Your response MUST be 400 words or fewer. Be succinct.""")
     ])
     
     # Format the prompt
@@ -317,6 +319,18 @@ based strictly on the information above.""")
         # Generate the report
         response = llm.invoke(formatted_prompt)
         report = extract_text_from_content(response.content)
+        
+        # Hard enforce: truncate to 500 words at the last complete sentence
+        words = report.split()
+        if len(words) > 500:
+            truncated = " ".join(words[:500])
+            # Cut at the last sentence-ending punctuation to avoid mid-sentence cutoff
+            for punct in [".", "!", "?"]:
+                last_pos = truncated.rfind(punct)
+                if last_pos != -1:
+                    truncated = truncated[:last_pos + 1]
+                    break
+            report = truncated
         
         return report
     
