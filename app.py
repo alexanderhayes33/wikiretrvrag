@@ -5,13 +5,15 @@ Designed for business analysts.
 """
 
 import os
+import json
 import warnings
-from typing import Tuple, List
+from typing import Tuple, List, Dict, Any
 from dotenv import load_dotenv
 import streamlit as st
 from langchain_community.retrievers import WikipediaRetriever
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 
 # Suppress PyTorch warnings
@@ -72,23 +74,96 @@ def initialize_llm(api_key: str):
 
 
 # ============================================================================
-# Q1: USER INPUT VALIDATION
+# Q1: USER INPUT VALIDATION (LLM-Powered)
 # ============================================================================
 
-def validate_industry_input(industry: str) -> Tuple[bool, str]:
+def validate_industry_input(user_input: str, llm: ChatOpenAI) -> Dict[str, Any]:
     """
-    Q1: Validate that the user has provided an industry input.
-    
+    Q1: Use an LLM to intelligently validate and classify the user's industry input.
+
+    The LLM evaluates the input and returns a JSON object with:
+      - status: "valid", "ambiguous", or "invalid"
+      - message: A short feedback message
+      - clarification_options: A list of 3 specific options if status is "ambiguous"
+
     Args:
-        industry: The industry string entered by the user
-        
+        user_input: The raw industry string entered by the user
+        llm: An initialized ChatOpenAI instance
+
     Returns:
-        Tuple of (is_valid, message)
+        A dict with keys: status, message, clarification_options
     """
-    if not industry or not industry.strip():
-        return False, "⚠️ Please enter an industry name to generate a report."
-    
-    return True, ""
+    # Fast-fail for empty input (no need to call the LLM)
+    if not user_input or not user_input.strip():
+        return {
+            "status": "invalid",
+            "message": "⚠️ Please enter an industry name to generate a report.",
+            "clarification_options": []
+        }
+
+    # ── LLM Validation Chain ──────────────────────────────────────────────
+    validation_prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert industry-classification assistant.
+Your job is to evaluate a user's text input and decide whether it clearly
+refers to a specific, searchable industry or market sector.
+
+Return ONLY a valid JSON object (no markdown, no extra text) with these keys:
+
+{{
+  "status": "valid" | "ambiguous" | "invalid",
+  "message": "<short feedback message>",
+  "clarification_options": ["<option 1>", "<option 2>", "<option 3>"]
+}}
+
+Classification rules:
+• "valid"   – The input clearly identifies one specific industry or market
+              sector that can be researched (e.g., "Electric Vehicles",
+              "Semiconductor Industry", "Cloud Computing").
+              Set clarification_options to an empty list [].
+
+• "ambiguous" – The input is too vague, is an acronym with multiple
+                meanings, or could refer to several different industries
+                (e.g., "AI", "pet", "chip", "green").
+                Provide exactly 3 clarification options phrased as
+                specific industries the user might mean.
+
+• "invalid"  – The input is gibberish, offensive, a greeting, a question,
+               or clearly not related to any industry/market sector
+               (e.g., "hello", "asdfgh", "what is this?").
+               Set clarification_options to an empty list []."""),
+        ("human", "User input: {user_input}")
+    ])
+
+    chain = validation_prompt | llm | StrOutputParser()
+
+    try:
+        raw_response = chain.invoke({"user_input": user_input.strip()})
+
+        # Strip possible markdown code fences the LLM might add
+        cleaned = raw_response.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1]  # remove opening fence line
+        if cleaned.endswith("```"):
+            cleaned = cleaned.rsplit("```", 1)[0]
+        cleaned = cleaned.strip()
+
+        result = json.loads(cleaned)
+
+        # Ensure expected keys exist with safe defaults
+        return {
+            "status": result.get("status", "invalid"),
+            "message": result.get("message", ""),
+            "clarification_options": result.get("clarification_options", [])
+        }
+
+    except (json.JSONDecodeError, Exception) as e:
+        # If the LLM response can't be parsed, treat the input as valid
+        # so the pipeline can still proceed (fail-open for usability).
+        return {
+            "status": "valid",
+            "message": f"⚠️ Validation returned an unexpected format — proceeding anyway. ({e})",
+            "clarification_options": []
+        }
 
 
 # ============================================================================
@@ -327,25 +402,40 @@ def main():
     
     # Process when generate button is clicked
     if generate_button:
-        # Q1: Validate input
-        is_valid, validation_message = validate_industry_input(industry)
-        
-        if not is_valid:
-            st.warning(validation_message)
-            st.stop()
-        
-        # Check API key availability
+        # ── Pre-flight check: API key must exist before any LLM call ──
         if not api_key:
             st.error("❌ OpenAI API key is required. Please configure it in the sidebar.")
             st.stop()
-        
-        # Initialize LLM
+
+        # Initialize LLM (needed for both validation and report generation)
         try:
             llm = initialize_llm(api_key)
         except Exception as e:
             st.error(f"❌ Error initializing LLM: {str(e)}")
             st.stop()
-        
+
+        # ── Q1: Intelligent Input Validation ──────────────────────────
+        with st.spinner("🧠 Analyzing your input..."):
+            validation = validate_industry_input(industry, llm)
+
+        if validation["status"] == "invalid":
+            st.error(f"🚫 {validation['message']}")
+            st.stop()
+
+        elif validation["status"] == "ambiguous":
+            st.warning(f"🤔 {validation['message']}")
+            st.markdown("**Please clarify — did you mean one of these?**")
+            for idx, option in enumerate(validation.get("clarification_options", []), 1):
+                st.info(f"{idx}. {option}")
+            st.caption("💡 Tip: Re-enter a more specific industry name above and click **Generate Report** again.")
+            st.stop()
+
+        # status == "valid" — proceed
+        if validation["message"]:
+            st.success(f"✅ {validation['message']}")
+
+        # (LLM already initialized above, skip duplicate init)
+
         # Q2: Retrieve Wikipedia documents
         with st.spinner("🔍 Retrieving relevant Wikipedia pages..."):
             documents, urls = retrieve_wikipedia_documents(industry, top_k=5)
